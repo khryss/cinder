@@ -130,6 +130,8 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
         self.img_suffix = None
         self._alloc_info_file_path = CONF.smbfs_allocation_info_file_path
 
+        self._thin_provisioning_support = True
+
     def _qemu_img_info(self, path, volume_name):
         return super(SmbfsDriver, self)._qemu_img_info_base(
             path, volume_name, self.configuration.smbfs_mount_point_base)

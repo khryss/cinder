@@ -21,6 +21,106 @@ from cinder import exception
 from cinder import test
 from cinder import utils
 from cinder.volume.drivers import remotefs
+from cinder.volume import utils as volume_utils
+
+
+class RemoteFSDriverTestCase(test.TestCase):
+    def setUp(self):
+        super(RemoteFSDriverTestCase, self).setUp()
+        self._driver = remotefs.RemoteFSDriver(
+            configuration=mock.Mock())
+
+    @mock.patch.object(remotefs.RemoteFSDriver, '_get_hash_str')
+    def test_get_mounted_share_from_pool_name(self, mock_get_hash_str):
+        mock_get_hash_str.side_effect = [mock.sentinel.pool_name0,
+                                         mock.sentinel.pool_name1,
+                                         mock.sentinel.pool_name2]
+        self._driver._mounted_shares = [mock.sentinel.share0,
+                                        mock.sentinel.share1,
+                                        mock.sentinel.share2]
+
+        return_value = self._driver._get_mounted_share_from_pool_name(
+            mock.sentinel.pool_name1)
+
+        self.assertEqual(return_value, mock.sentinel.share1)
+        mock_get_hash_str.assert_has_calls(
+            [mock.call(mock.sentinel.share0),
+             mock.call(mock.sentinel.share1)])
+
+    @mock.patch.object(remotefs.RemoteFSDriver, '_ensure_shares_mounted')
+    @mock.patch.object(remotefs.RemoteFSDriver, '_get_capacity_info')
+    @mock.patch.object(remotefs.RemoteFSDriver, '_get_hash_str')
+    def test_update_volume_stats(self, mock_get_hash_str,
+                                 mock_get_capacity_info,
+                                 mock_ensure_shares_mounted):
+
+        FAKE_TOTAL_GB_SHARE0 = 100
+        FAKE_TOTAL_GB_SHARE1 = 80
+        FAKE_FREE_GB_SHARE0 = 10
+        FAKE_FREE_GB_SHARE1 = 8
+
+        self._driver._thin_provisioning_support = (
+            mock.sentinel.thin_provisioning_support)
+
+        self._driver._mounted_shares = [mock.sentinel.share0,
+                                        mock.sentinel.share1]
+        mock_get_capacity_info.side_effect = [
+            (FAKE_TOTAL_GB_SHARE0,
+             FAKE_FREE_GB_SHARE0,
+             mock.sentinel.unused_allocated_gb_share0),
+            (FAKE_TOTAL_GB_SHARE1,
+             FAKE_FREE_GB_SHARE1,
+             mock.sentinel.unused_allocated_gb_share1)]
+        # The pool names are in fact hashes of the share locations.
+        mock_get_hash_str.side_effect = [mock.sentinel.pool_name0,
+                                         mock.sentinel.pool_name1]
+
+        expected_pools = []
+        expected_pool0 = {
+            'pool_name': mock.sentinel.pool_name0,
+            'total_capacity_gb': FAKE_TOTAL_GB_SHARE0 / float(units.Gi),
+            'free_capacity_gb': FAKE_FREE_GB_SHARE0 / float(units.Gi),
+            'reserved_percentage': (
+                self._driver.configuration.reserved_percentage),
+            'max_over_subscription_ratio': (
+                self._driver.configuration.max_over_subscription_ratio),
+            'thin_provisioning_support': (
+                mock.sentinel.thin_provisioning_support),
+            'QoS_support': False}
+        expected_pools.append(expected_pool0)
+
+        expected_pool1 = {
+            'pool_name': mock.sentinel.pool_name1,
+            'total_capacity_gb': FAKE_TOTAL_GB_SHARE1 / float(units.Gi),
+            'free_capacity_gb': FAKE_FREE_GB_SHARE1 / float(units.Gi),
+            'reserved_percentage': (
+                self._driver.configuration.reserved_percentage),
+            'max_over_subscription_ratio': (
+                self._driver.configuration.max_over_subscription_ratio),
+            'thin_provisioning_support': (
+                mock.sentinel.thin_provisioning_support),
+            'QoS_support': False}
+        expected_pools.append(expected_pool1)
+
+        expected_stats = {
+            'volume_backend_name':
+                self._driver.configuration.safe_get.return_value,
+            'vendor_name': 'Open Source',
+            'driver_version': self._driver.get_version(),
+            'storage_protocol': self._driver.driver_volume_type,
+            'total_capacity_gb': 0,
+            'free_capacity_gb': 0,
+            'pools': expected_pools}
+
+        self._driver._update_volume_stats()
+
+        self.assertEqual(self._driver._stats, expected_stats)
+        mock_get_hash_str.assert_has_calls(
+            [mock.call(share)
+             for share in self._driver._mounted_shares])
+        mock_get_capacity_info.assert_has_calls(
+            [mock.call(share)
+             for share in self._driver._mounted_shares])
 
 
 class RemoteFsSnapDriverTestCase(test.TestCase):
@@ -156,6 +256,44 @@ class RemoteFsSnapDriverTestCase(test.TestCase):
                 fake_base_img_info.file_format)
             self._driver._write_info_file.assert_called_once_with(
                 mock.sentinel.fake_info_path, expected_info)
+
+    @mock.patch.object(volume_utils,
+                       'extract_host')
+    @mock.patch.object(remotefs.RemoteFSSnapDriver,
+                       '_copy_volume_from_snapshot')
+    @mock.patch.object(remotefs.RemoteFSSnapDriver,
+                       '_do_create_volume')
+    @mock.patch.object(remotefs.RemoteFSSnapDriver,
+                       '_get_mounted_share_from_pool_name')
+    @mock.patch.object(remotefs.RemoteFSSnapDriver,
+                       '_ensure_shares_mounted')
+    def test_create_volume_from_snapshot(self, mock_ensure_shares_mounted,
+                                         mock_get_mounted_share_from_pool_name,
+                                         mock_do_create_volume,
+                                         mock_copy_volume_from_snapshot,
+                                         mock_extract_host):
+        mock_get_mounted_share_from_pool_name.return_value = (
+            mock.sentinel.share)
+        mock_extract_host.return_value = mock.sentinel.extracted_host
+
+        fake_volume = {'provider_location': None,
+                       'host': mock.sentinel.volume_host,
+                       'size': mock.sentinel.volume_size}
+        fake_snapshot = {'status': 'available'}
+
+        self._driver._create_volume_from_snapshot(fake_volume,
+                                                  fake_snapshot)
+
+        expected_volume = {'provider_location': mock.sentinel.share,
+                           'host': mock.sentinel.volume_host,
+                           'size': mock.sentinel.volume_size}
+
+        mock_do_create_volume.assert_has_calls([
+            mock.call(expected_volume)])
+        mock_copy_volume_from_snapshot.assert_has_calls([
+            mock.call(fake_snapshot,
+                      expected_volume,
+                      expected_volume['size'])])
 
     def test_delete_snapshot_when_active_file(self):
         self._test_delete_snapshot()

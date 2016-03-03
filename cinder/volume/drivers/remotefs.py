@@ -34,6 +34,7 @@ from cinder import utils
 from cinder.i18n import _, _LE, _LI, _LW
 from cinder.image import image_utils
 from cinder.volume import driver
+from cinder.volume import utils as volume_utils
 
 LOG = logging.getLogger(__name__)
 
@@ -147,9 +148,14 @@ class RemoteFSDriver(driver.LocalVD, driver.TransferVD, driver.BaseVD):
         self._execute_as_root = True
         self._is_voldb_empty_at_startup = kwargs.pop('is_vol_db_empty', None)
 
+        # We let the drivers inheriting this specify
+        # whether thin provisioning is supported.
+        self._thin_provisioning_support = False
         if self.configuration:
             self.configuration.append_config_values(nas_opts)
             self.configuration.append_config_values(volume_opts)
+            self._thin_provisioning_support = (
+                self.configuration.nas_volume_prov_type == 'thin')
 
     def check_for_setup_error(self):
         """Just to override parent behavior."""
@@ -199,6 +205,7 @@ class RemoteFSDriver(driver.LocalVD, driver.TransferVD, driver.BaseVD):
         Get the sum of sizes of volumes, snapshots and any other
         files on the mountpoint.
         """
+
         provisioned_size = 0.0
         for share in self.shares.keys():
             mount_path = self._get_mount_point_for_share(share)
@@ -230,13 +237,40 @@ class RemoteFSDriver(driver.LocalVD, driver.TransferVD, driver.BaseVD):
         """
         self._ensure_shares_mounted()
 
-        volume['provider_location'] = self._find_share(volume['size'])
+        # If a pool name is set, we try to retrieve the according share
+        # location based on that.
+        pool_name = volume_utils.extract_host(volume['host'],
+                                              level='pool')
+        share = (self._get_mounted_share_from_pool_name(pool_name) or
+                 self._find_share(volume['size']))
 
+        volume['provider_location'] = share
         LOG.info(_LI('casted to %s'), volume['provider_location'])
 
         self._do_create_volume(volume)
 
         return {'provider_location': volume['provider_location']}
+
+    def _get_mounted_share_from_pool_name(self, pool_name):
+        # In our case, the pool name will be a hash of the share
+        # location.
+        if not pool_name:
+            LOG.debug("No pool name was provided.")
+            return
+        for share in self._mounted_shares:
+            if pool_name == self._get_hash_str(share):
+                return share
+        LOG.debug("Could not find any share for the pool name: %s",
+                  pool_name)
+
+    def _get_hash_str(self, base_str):
+        """Return a string that represents hash of base_str.
+
+        Returns string in a hex format.
+        """
+        if isinstance(base_str, six.text_type):
+            base_str = base_str.encode('utf-8')
+        return hashlib.md5(base_str).hexdigest()
 
     def _do_create_volume(self, volume):
         """Create a volume on given remote share.
@@ -509,6 +543,7 @@ class RemoteFSDriver(driver.LocalVD, driver.TransferVD, driver.BaseVD):
         """Retrieve stats info from volume group."""
 
         data = {}
+        pools = []
         backend_name = self.configuration.safe_get('volume_backend_name')
         data['volume_backend_name'] = backend_name or self.volume_backend_name
         data['vendor_name'] = 'Open Source'
@@ -517,17 +552,29 @@ class RemoteFSDriver(driver.LocalVD, driver.TransferVD, driver.BaseVD):
 
         self._ensure_shares_mounted()
 
-        global_capacity = 0
-        global_free = 0
         for share in self._mounted_shares:
-            capacity, free, used = self._get_capacity_info(share)
-            global_capacity += capacity
-            global_free += free
+            (share_capacity,
+             share_free,
+             share_used) = self._get_capacity_info(share)
 
-        data['total_capacity_gb'] = global_capacity / float(units.Gi)
-        data['free_capacity_gb'] = global_free / float(units.Gi)
-        data['reserved_percentage'] = self.configuration.reserved_percentage
-        data['QoS_support'] = False
+            pool = {'pool_name': self._get_hash_str(share),
+                    'total_capacity_gb': share_capacity / float(units.Gi),
+                    'free_capacity_gb': share_free / float(units.Gi),
+                    'reserved_percentage': (
+                        self.configuration.reserved_percentage),
+                    'max_over_subscription_ratio': (
+                        self.configuration.max_over_subscription_ratio),
+                    'thin_provisioning_support': (
+                        self._thin_provisioning_support),
+                    'QoS_support': False,
+                    }
+
+            pools.append(pool)
+
+        data['total_capacity_gb'] = 0
+        data['free_capacity_gb'] = 0
+        data['pools'] = pools
+
         self._stats = data
 
     def _get_capacity_info(self, share):
@@ -765,15 +812,6 @@ class RemoteFSSnapDriver(RemoteFSDriver, driver.SnapshotVD):
             output.append(new_info)
 
         return output
-
-    def _get_hash_str(self, base_str):
-        """Return a string that represents hash of base_str.
-
-        Returns string in a hex format.
-        """
-        if isinstance(base_str, six.text_type):
-            base_str = base_str.encode('utf-8')
-        return hashlib.md5(base_str).hexdigest()
 
     def _get_mount_point_for_share(self, share):
         """Return mount point for share.
@@ -1081,7 +1119,13 @@ class RemoteFSSnapDriver(RemoteFSDriver, driver.SnapshotVD):
 
         self._ensure_shares_mounted()
 
-        volume['provider_location'] = self._find_share(volume['size'])
+        pool_name = volume_utils.extract_host(volume['host'],
+                                              level='pool')
+
+        share = (self._get_mounted_share_from_pool_name(pool_name) or
+                 self._find_share(volume['size']))
+
+        volume['provider_location'] = share
 
         self._do_create_volume(volume)
 
