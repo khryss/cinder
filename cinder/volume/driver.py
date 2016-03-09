@@ -48,7 +48,8 @@ volume_opts = [
     cfg.IntOpt('reserved_percentage',
                default=0,
                min=0, max=100,
-               help='The percentage of backend capacity is reserved'),
+               help='The percentage of backend capacity is reserved',
+               deprecated_name = 'smbfs_used_ratio'),
     cfg.StrOpt('iscsi_target_prefix',
                default='iqn.2010-10.org.openstack:',
                help='Prefix for iSCSI volumes'),
@@ -166,7 +167,8 @@ volume_opts = [
                       'total physical capacity. A ratio of 1.0 means '
                       'provisioned capacity cannot exceed the total physical '
                       'capacity. A ratio lower than 1.0 will be ignored and '
-                      'the default value will be used instead.'),
+                      'the default value will be used instead.',
+                 deprecated_name = 'smbfs_oversub_ratio'),
     cfg.StrOpt('scst_target_iqn_name',
                help='Certain ISCSI targets have predefined target names, '
                     'SCST target driver uses this name.'),

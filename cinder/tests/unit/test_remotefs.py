@@ -17,6 +17,8 @@ import os
 
 import mock
 
+from oslo_utils import units
+
 from cinder import exception
 from cinder import test
 from cinder import utils

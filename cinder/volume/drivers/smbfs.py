@@ -55,16 +55,6 @@ volume_opts = [
                 help=('Create volumes as sparsed files which take no space '
                       'rather than regular files when using raw format, '
                       'in which case volume creation takes lot of time.')),
-    cfg.FloatOpt('smbfs_used_ratio',
-                 default=0.95,
-                 help=('Percent of ACTUAL usage of the underlying volume '
-                       'before no new volumes can be allocated to the volume '
-                       'destination.')),
-    cfg.FloatOpt('smbfs_oversub_ratio',
-                 default=1.0,
-                 help=('This will compare the allocated to available space on '
-                       'the volume destination.  If the ratio exceeds this '
-                       'number, the destination will no longer be valid.')),
     cfg.StrOpt('smbfs_mount_point_base',
                default='$state_path/mnt',
                help=('Base dir containing mount points for smbfs shares.')),
@@ -76,25 +66,6 @@ volume_opts = [
 
 CONF = cfg.CONF
 CONF.register_opts(volume_opts)
-
-
-def update_allocation_data(delete=False):
-    @decorator.decorator
-    def wrapper(func, inst, *args, **kwargs):
-        ret_val = func(inst, *args, **kwargs)
-
-        call_args = inspect.getcallargs(func, inst, *args, **kwargs)
-        volume = call_args['volume']
-        requested_size = call_args.get('size_gb', None)
-
-        if delete:
-            allocated_size_gb = None
-        else:
-            allocated_size_gb = requested_size or volume['size']
-
-        inst.update_disk_allocation_data(volume, allocated_size_gb)
-        return ret_val
-    return wrapper
 
 
 class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
@@ -178,67 +149,22 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
             msg = _("Invalid mount point base: %s") % self.base
             LOG.error(msg)
             raise exception.SmbfsException(msg)
-        if not self.configuration.smbfs_oversub_ratio > 0:
+        if not self.configuration.max_over_subscription_ratio >= 1:
             msg = _(
-                "SMBFS config 'smbfs_oversub_ratio' invalid.  Must be > 0: "
-                "%s") % self.configuration.smbfs_oversub_ratio
+                "SMBFS config 'max_over_subscription_ratio' invalid.  Must be "
+                ">= 1: %s") % self.configuration.max_over_subscription_ratio
 
             LOG.error(msg)
             raise exception.SmbfsException(msg)
 
-        if not 0 < self.configuration.smbfs_used_ratio <= 1:
-            msg = _("SMBFS config 'smbfs_used_ratio' invalid.  Must be > 0 "
-                    "and <= 1.0: %s") % self.configuration.smbfs_used_ratio
+        if not 0 <= self.configuration.reserved_percentage <= 100:
+            msg = _("SMBFS config 'reserved_percentage' invalid.  Must be >= 0 "
+                    "and <= 100: %s") % self.configuration.reserved_percentage
             LOG.error(msg)
             raise exception.SmbfsException(msg)
 
         self.shares = {}  # address : options
         self._ensure_shares_mounted()
-        self._setup_allocation_data()
-
-    def _setup_allocation_data(self):
-        if not os.path.exists(self._alloc_info_file_path):
-            fileutils.ensure_tree(
-                os.path.dirname(self._alloc_info_file_path))
-            self._allocation_data = {}
-            self._update_allocation_data_file()
-        else:
-            with open(self._alloc_info_file_path, 'r') as f:
-                self._allocation_data = json.load(f)
-
-    def update_disk_allocation_data(self, volume, virtual_size_gb=None):
-        volume_name = volume['name']
-        smbfs_share = volume['provider_location']
-        if smbfs_share:
-            share_hash = self._get_hash_str(smbfs_share)
-        else:
-            return
-
-        share_alloc_data = self._allocation_data.get(share_hash, {})
-        old_virtual_size = share_alloc_data.get(volume_name, 0)
-        total_allocated = share_alloc_data.get('total_allocated', 0)
-
-        if virtual_size_gb:
-            share_alloc_data[volume_name] = virtual_size_gb
-            total_allocated += virtual_size_gb - old_virtual_size
-        elif share_alloc_data.get(volume_name):
-            # The volume is deleted.
-            del share_alloc_data[volume_name]
-            total_allocated -= old_virtual_size
-
-        share_alloc_data['total_allocated'] = total_allocated
-        self._allocation_data[share_hash] = share_alloc_data
-        self._update_allocation_data_file()
-
-    def _update_allocation_data_file(self):
-        with open(self._alloc_info_file_path, 'w') as f:
-            json.dump(self._allocation_data, f)
-
-    def _get_total_allocated(self, smbfs_share):
-        share_hash = self._get_hash_str(smbfs_share)
-        share_alloc_data = self._allocation_data.get(share_hash, {})
-        total_allocated = share_alloc_data.get('total_allocated', 0) << 30
-        return float(total_allocated)
 
     def local_path(self, volume):
         """Get volume path (mounted locally fs path) for given volume.
@@ -300,7 +226,6 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
         return volume_format
 
     @remotefs_drv.locked_volume_id_operation
-    @update_allocation_data(delete=True)
     def delete_volume(self, volume):
         """Deletes a logical volume."""
         if not volume['provider_location']:
@@ -332,7 +257,6 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
                       run_as_root=True)
 
     @remotefs_drv.locked_volume_id_operation
-    @update_allocation_data()
     def create_volume(self, volume):
         return super(SmbfsDriver, self).create_volume(volume)
 
@@ -366,95 +290,6 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
 
         self._set_rw_permissions_for_all(volume_path)
 
-    def _get_capacity_info(self, smbfs_share):
-        """Calculate available space on the SMBFS share.
-
-        :param smbfs_share: example //172.18.194.100/share
-        """
-
-        mount_point = self._get_mount_point_for_share(smbfs_share)
-
-        df, _ = self._execute('stat', '-f', '-c', '%S %b %a', mount_point,
-                              run_as_root=True)
-        block_size, blocks_total, blocks_avail = map(float, df.split())
-        total_available = block_size * blocks_avail
-        total_size = block_size * blocks_total
-
-        total_allocated = self._get_total_allocated(smbfs_share)
-        return total_size, total_available, total_allocated
-
-    def _find_share(self, volume_size_in_gib):
-        """Choose SMBFS share among available ones for given volume size.
-
-        For instances with more than one share that meets the criteria, the
-        share with the least "allocated" space will be selected.
-
-        :param volume_size_in_gib: int size in GB
-        """
-
-        if not self._mounted_shares:
-            raise exception.SmbfsNoSharesMounted()
-
-        target_share = None
-        target_share_reserved = 0
-
-        for smbfs_share in self._mounted_shares:
-            if not self._is_share_eligible(smbfs_share, volume_size_in_gib):
-                continue
-            total_allocated = self._get_total_allocated(smbfs_share)
-            if target_share is not None:
-                if target_share_reserved > total_allocated:
-                    target_share = smbfs_share
-                    target_share_reserved = total_allocated
-            else:
-                target_share = smbfs_share
-                target_share_reserved = total_allocated
-
-        if target_share is None:
-            raise exception.SmbfsNoSuitableShareFound(
-                volume_size=volume_size_in_gib)
-
-        LOG.debug('Selected %s as target smbfs share.', target_share)
-
-        return target_share
-
-    def _is_share_eligible(self, smbfs_share, volume_size_in_gib):
-        """Verifies SMBFS share is eligible to host volume with given size.
-
-        First validation step: ratio of actual space (used_space / total_space)
-        is less than 'smbfs_used_ratio'. Second validation step: apparent space
-        allocated (differs from actual space used when using sparse files)
-        and compares the apparent available
-        space (total_available * smbfs_oversub_ratio) to ensure enough space is
-        available for the new volume.
-
-        :param smbfs_share: smbfs share
-        :param volume_size_in_gib: int size in GB
-        """
-
-        used_ratio = self.configuration.smbfs_used_ratio
-        oversub_ratio = self.configuration.smbfs_oversub_ratio
-        requested_volume_size = volume_size_in_gib * units.Gi
-
-        total_size, total_available, total_allocated = \
-            self._get_capacity_info(smbfs_share)
-
-        apparent_size = max(0, total_size * oversub_ratio)
-        apparent_available = max(0, apparent_size - total_allocated)
-        used = (total_size - total_available) / total_size
-
-        if used > used_ratio:
-            LOG.debug('%s is above smbfs_used_ratio.', smbfs_share)
-            return False
-        if apparent_available <= requested_volume_size:
-            LOG.debug('%s is above smbfs_oversub_ratio.', smbfs_share)
-            return False
-        if total_allocated / total_size >= oversub_ratio:
-            LOG.debug('%s reserved space is above smbfs_oversub_ratio.',
-                      smbfs_share)
-            return False
-        return True
-
     def _create_snapshot_online(self, snapshot, backing_filename,
                                 new_snap_path):
         msg = _("This driver does not support snapshotting in-use volumes.")
@@ -478,7 +313,6 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
             raise exception.InvalidVolume(err_msg)
 
     @remotefs_drv.locked_volume_id_operation
-    @update_allocation_data()
     def extend_volume(self, volume, size_gb):
         LOG.info(_LI('Extending volume %s.'), volume['id'])
         self._extend_volume(volume, size_gb)
@@ -523,15 +357,7 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
                     'driver when no snapshots exist.')
             raise exception.InvalidVolume(msg)
 
-        extend_by = int(size_gb) - volume['size']
-        if not self._is_share_eligible(volume['provider_location'],
-                                       extend_by):
-            raise exception.ExtendVolumeError(reason='Insufficient space to '
-                                              'extend volume %s to %sG.'
-                                              % (volume['id'], size_gb))
-
     @remotefs_drv.locked_volume_id_operation
-    @update_allocation_data()
     def create_volume_from_snapshot(self, volume, snapshot):
         return self._create_volume_from_snapshot(volume, snapshot)
 
@@ -593,7 +419,6 @@ class SmbfsDriver(remotefs_drv.RemoteFSSnapDriver):
                 + (_(" but size is now %d.") % virt_size))
 
     @remotefs_drv.locked_volume_id_operation
-    @update_allocation_data()
     def create_cloned_volume(self, volume, src_vref):
         """Creates a clone of the specified volume."""
         return self._create_cloned_volume(volume, src_vref)

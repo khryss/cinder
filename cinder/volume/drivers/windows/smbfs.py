@@ -98,20 +98,16 @@ class WindowsSmbfsDriver(smbfs.SmbfsDriver):
     def _delete(self, path):
         fileutils.delete_if_exists(path)
 
-    def _get_capacity_info(self, smbfs_share):
+    def _get_available_capacity(self, smbfs_share):
         """Calculate available space on the SMBFS share.
 
         :param smbfs_share: example //172.18.194.100/var/smbfs
         """
         total_available, total_size = self._smbutils.get_share_capacity_info(
             smbfs_share)
-        total_allocated = self._get_total_allocated(smbfs_share)
-        return_value = [total_size, total_available, total_allocated]
-        LOG.info(_LI('Smb share %(share)s Total size %(size)s '
-                     'Total allocated %(allocated)s'),
-                 {'share': smbfs_share, 'size': total_size,
-                  'allocated': total_allocated})
-        return [float(x) for x in return_value]
+        LOG.info(_LI('Smb share %(share)s Total size %(size)s '),
+                 {'share': smbfs_share, 'size': total_size,})
+        return float(total_size), float(total_available)
 
     def _img_commit(self, snapshot_path):
         self._vhdutils.merge_vhd(snapshot_path)

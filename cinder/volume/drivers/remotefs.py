@@ -826,10 +826,10 @@ class RemoteFSSnapDriver(RemoteFSDriver, driver.SnapshotVD):
         :param share: example 172.18.194.100:/var/fs
         """
         mount_point = self._get_mount_point_for_share(share)
-
         out, _ = self._execute('df', '--portability', '--block-size', '1',
                                mount_point,
                                run_as_root=self._execute_as_root)
+
         out = out.splitlines()[1]
 
         size = int(out.split()[1])
