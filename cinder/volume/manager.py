@@ -722,8 +722,7 @@ class VolumeManager(manager.SchedulerDependentManager):
             try:
                 self.stats['pools'][pool]['allocated_capacity_gb'] -= size
             except KeyError:
-                self.stats['pools'][pool] = dict(
-                    allocated_capacity_gb=-size)
+                pass
 
             self.publish_service_capabilities(context)
 
@@ -2034,8 +2033,34 @@ class VolumeManager(manager.SchedulerDependentManager):
                 volume.status = 'error_extending'
                 volume.save()
 
-        project_id = volume.project_id
+        stats = self.driver.get_volume_stats(refresh=True)
+        pool = vol_utils.extract_host(volume.host, 'pool')
         size_increase = (int(new_size)) - volume.size
+
+        if pool:
+            pool_stats = (pool_stats for pool_stats in stats['pools']
+                          if pool_stats['pool_name'] == pool).next()
+        else:
+            # Legacy volume, put them into default pool
+            pool = self.driver.configuration.safe_get(
+                'volume_backend_name') or vol_utils.extract_host(
+                    volume.host, 'pool', True)
+            pool_stats = stats
+
+        allocated_capacity_gb = self.stats['pools'][pool_stats[
+            'pool_name']].get('allocated_capacity_gb', 0)
+        if not self._is_pool_eligible(pool_stats,
+                                      allocated_capacity_gb,
+                                      size_increase):
+            volume.status = 'error_extending'
+            volume.save()
+            exception_msg = ('Failed to extend volume %(volume_id)s to new size'
+                '%(new_size)s. The pool on which it resides is not eligible'
+                'for the requested new size.' % dict(volume_id=volume['id'],
+                                                     new_size=new_size))
+            raise exception.ExtendVolumeError(exception_msg)
+
+        project_id = volume.project_id
         self._notify_about_volume_usage(context, volume, "resize.start")
         try:
             self.driver.extend_volume(volume, new_size)
@@ -2055,12 +2080,6 @@ class VolumeManager(manager.SchedulerDependentManager):
         QUOTAS.commit(context, reservations, project_id=project_id)
         volume.update({'size': int(new_size), 'status': 'available'})
         volume.save()
-        pool = vol_utils.extract_host(volume.host, 'pool')
-        if pool is None:
-            # Legacy volume, put them into default pool
-            pool = self.driver.configuration.safe_get(
-                'volume_backend_name') or vol_utils.extract_host(
-                    volume.host, 'pool', True)
 
         try:
             self.stats['pools'][pool]['allocated_capacity_gb'] += size_increase
@@ -2073,6 +2092,43 @@ class VolumeManager(manager.SchedulerDependentManager):
             extra_usage_info={'size': int(new_size)})
         LOG.info(_LI("Extend volume completed successfully."),
                  resource=volume)
+
+    def _is_pool_eligible(self, pool_stats, allocated_capacity_gb, size):
+        is_eligible = True
+
+        provisioned_gb = pool_stats.get('provisioned_capacity_gb',
+                         allocated_capacity_gb)
+        reserved_percentage = self.driver.configuration.reserved_percentage
+        max_over_sub_ratio = (
+            self.driver.configuration.max_over_subscription_ratio)
+        total_capacity_gb = pool_stats['total_capacity_gb']
+        new_free_capacity_gb = pool_stats['free_capacity_gb']
+        
+
+        apparent_size_gb = (
+            max(0, total_capacity_gb * max_over_sub_ratio))
+        apparent_available = (
+            max(0, apparent_size_gb - allocated_capacity_gb))
+        new_free_percentage = (
+            (new_free_capacity_gb / total_capacity_gb) * 100)
+
+        if new_free_percentage < reserved_percentage:
+            LOG.error(_LE('%s extend request is above reserved_percentage.'),
+                pool_stats['pool_name'])
+            is_eligible = False
+
+        if apparent_available <= size:
+            LOG.error(_LE('%s extend request is above '
+                'max_over_subscription_ratio.'), pool_stats['pool_name'])
+            is_eligible = False
+            
+        if (allocated_capacity_gb / total_capacity_gb >=
+                max_over_sub_ratio):
+            LOG.error(_LE('%s extend request is above '
+                      'max_over_subscription_ratio.'), pool_stats['pool_name'])
+            is_eligible = False
+
+        return is_eligible
 
     def retype(self, ctxt, volume_id, new_type_id, host,
                migration_policy='never', reservations=None,

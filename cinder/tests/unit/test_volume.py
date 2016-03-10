@@ -4037,6 +4037,29 @@ class VolumeTestCase(BaseVolumeTestCase):
         # clean up
         self.volume.delete_volume(self.context, volume['id'])
 
+    def test_is_pool_eligible(self):
+        fake_reserved_percentage = 0
+        fake_max_oversub_ratio = 1.1
+        fake_pool_name = '123456789'
+        fake_total_capacity_gb = 100
+        fake_free_capacity_gb = 99
+        fake_allocated_capacity_gb = 80
+
+        fake_requested_size = 30
+        fake_pool_stats = {'pool_name' : fake_pool_name,
+                          'total_capacity_gb' : fake_total_capacity_gb,
+                          'free_capacity_gb': fake_free_capacity_gb}
+
+        self.volume.driver.configuration.reserved_percentage = \
+            fake_reserved_percentage
+        self.volume.driver.configuration.max_over_subscription_ratio = \
+            fake_max_oversub_ratio
+
+        self.assertTrue(
+            self.volume._is_pool_eligible(fake_pool_stats,
+                                          fake_allocated_capacity_gb,
+                                          fake_requested_size))
+
     def test_extend_volume_with_volume_type(self):
         elevated = context.get_admin_context()
         project_id = self.context.project_id
